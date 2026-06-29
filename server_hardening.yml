@@ -65,6 +65,8 @@
         name: "{{ item }}"
         groups: sshusers
         append: true
+        shell: /bin/bash
+        create_home: true
       loop: "{{ ssh_users_list }}"
       when: ssh_users_list | length > 0
 
@@ -154,6 +156,8 @@
         name: "{{ item }}"
         groups: sudousers
         append: true
+        shell: /bin/bash
+        create_home: true
       loop: "{{ sudo_users_list }}"
       when: sudo_users_list | length > 0
 
@@ -188,6 +192,8 @@
         name: "{{ item }}"
         groups: suusers
         append: true
+        shell: /bin/bash
+        create_home: true
       loop: "{{ su_users_list }}"
       when: su_users_list | length > 0
 
