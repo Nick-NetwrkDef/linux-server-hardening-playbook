@@ -1,0 +1,292 @@
+---
+# =============================================================================
+# Server Hardening Playbook
+# Covers: SSH hardening, sudo/su restrictions, Diffie-Hellman cleanup,
+#         NTP verification, and unattended security upgrades
+#
+# Usage:
+#   ansible-playbook server_hardening.yml -i inventory.ini \
+#     -e "ssh_users=user1,user2 sudo_users=user1 su_users=user1"
+#
+# Variables (set in vars section below or pass via -e):
+#   ssh_users   - comma-separated list of users allowed to SSH
+#   sudo_users  - comma-separated list of users allowed to use sudo
+#   su_users    - comma-separated list of users allowed to use su
+# =============================================================================
+
+- name: Server Hardening
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    ssh_users: ["ubuntu"]        # e.g. ["user1", "user2"]
+    sudo_users: ["ubuntu"]       # e.g. ["user1"]
+    su_users: ["ubuntu"]         # e.g. ["user1"]
+    alert_email: "root"  # Email for apticron / unattended-upgrade alerts
+
+  # ---------------------------------------------------------------------------
+  # PRE-TASKS: sanity checks
+  # ---------------------------------------------------------------------------
+  pre_tasks:
+    - name: Assert target OS is Debian/Ubuntu
+      assert:
+        that: ansible_os_family == "Debian"
+        fail_msg: "This playbook is designed for Debian/Ubuntu systems only."
+
+  # ---------------------------------------------------------------------------
+  # TASKS
+  # ---------------------------------------------------------------------------
+  tasks:
+
+    # =========================================================================
+    # 1. SSH GROUP
+    # =========================================================================
+    - name: Create sshusers group
+      group:
+        name: sshusers
+        state: present
+
+    - name: Add users to sshusers group
+      user:
+        name: "{{ item }}"
+        groups: sshusers
+        append: true
+      loop: "{{ ssh_users }}"
+      when: ssh_users | length > 0
+
+    # =========================================================================
+    # 2. BACKUP & HARDEN /etc/ssh/sshd_config
+    # =========================================================================
+    - name: Backup sshd_config
+      copy:
+        src: /etc/ssh/sshd_config
+        dest: "/etc/ssh/sshd_config-COPY-{{ ansible_date_time.iso8601_basic_short }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Apply hardened sshd_config
+      blockinfile:
+        path: /etc/ssh/sshd_config
+        backup: false
+        marker: "# {mark} ANSIBLE MANAGED HARDENING BLOCK"
+        block: |
+          # --- Security settings ---
+          LogLevel VERBOSE
+          PermitUserEnvironment no
+          AllowTcpForwarding no
+          AllowStreamLocalForwarding no
+          GatewayPorts no
+          PermitTunnel no
+          PermitEmptyPasswords no
+          IgnoreRhosts yes
+          UseDNS yes
+          Compression no
+          TCPKeepAlive no
+          AllowAgentForwarding no
+          PermitRootLogin no
+          HostbasedAuthentication no
+          # --- Session & auth limits ---
+          AllowGroups sshusers
+          ClientAliveCountMax 3
+          ClientAliveInterval 15
+          LoginGraceTime 30
+          MaxAuthTries 3
+          MaxSessions 2
+          MaxStartups 3
+          PasswordAuthentication no
+
+    - name: Check for duplicate sshd_config keys (excluding HostKey)
+      shell: |
+        awk 'NF && $1!~/^(#|HostKey)/{print $1}' /etc/ssh/sshd_config \
+          | sort | uniq -c | grep -v ' 1 '
+      register: sshd_duplicates
+      changed_when: false
+      failed_when: sshd_duplicates.stdout | length > 0
+
+    - name: Validate sshd_config syntax
+      command: sshd -t
+      changed_when: false
+
+    - name: Restart SSH service
+      service:
+        name: ssh
+        state: restarted
+        enabled: true
+
+    # =========================================================================
+    # 3. REMOVE SHORT DIFFIE-HELLMAN KEYS (< 3072 bits)
+    # =========================================================================
+    - name: Backup /etc/ssh/moduli
+      copy:
+        src: /etc/ssh/moduli
+        dest: "/etc/ssh/moduli-COPY-{{ ansible_date_time.iso8601_basic_short }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Filter out short DH moduli (keep >= 3072 bits)
+      shell: |
+        awk '$5 >= 3071' /etc/ssh/moduli > /etc/ssh/moduli.tmp \
+          && mv /etc/ssh/moduli.tmp /etc/ssh/moduli
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    # =========================================================================
+    # 4. LIMIT SUDO ACCESS
+    # =========================================================================
+    - name: Check current sudo group membership
+      command: grep sudo /etc/group
+      register: sudo_group_check
+      changed_when: false
+      failed_when: false
+
+    - name: Show current sudo group members
+      debug:
+        msg: "{{ sudo_group_check.stdout }}"
+
+    - name: Create sudousers group
+      group:
+        name: sudousers
+        state: present
+
+    - name: Add users to sudousers group
+      user:
+        name: "{{ item }}"
+        groups: sudousers
+        append: true
+      loop: "{{ sudo_users }}"
+      when: sudo_users | length > 0
+
+    - name: Backup /etc/sudoers
+      copy:
+        src: /etc/sudoers
+        dest: "/etc/sudoers-COPY-{{ ansible_date_time.iso8601_basic_short }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0440"
+
+    - name: Grant sudousers group full sudo access
+      lineinfile:
+        path: /etc/sudoers
+        line: "%sudousers   ALL=(ALL:ALL) NOPASSWD:ALL"
+        validate: "visudo -cf %s"
+        state: present
+
+    # =========================================================================
+    # 5. LIMIT SU ACCESS
+    # =========================================================================
+    - name: Create suusers group
+      group:
+        name: suusers
+        state: present
+
+    - name: Add users to suusers group
+      user:
+        name: "{{ item }}"
+        groups: suusers
+        append: true
+      loop: "{{ su_users }}"
+      when: su_users | length > 0
+
+    - name: Restrict /bin/su to suusers group (setuid 4750)
+      command: dpkg-statoverride --update --add root suusers 4750 /bin/su
+      register: su_override
+      # dpkg-statoverride exits 1 if the override already exists
+      failed_when: su_override.rc not in [0, 1, 2]
+      changed_when: su_override.rc == 0
+
+    # =========================================================================
+    # 6. VERIFY NTP IS RUNNING
+    # =========================================================================
+    - name: Check timedatectl status
+      command: timedatectl
+      register: timedatectl_status
+      changed_when: false
+
+    - name: Show timedatectl output
+      debug:
+        msg: "{{ timedatectl_status.stdout_lines }}"
+
+    # =========================================================================
+    # 7. AUTOMATIC SECURITY UPDATES (unattended-upgrades + apticron)
+    # =========================================================================
+    - name: Install unattended-upgrades, apt-listchanges, apticron
+      apt:
+        name:
+          - unattended-upgrades
+          - apt-listchanges
+          - apticron
+        state: present
+        update_cache: true
+
+    - name: Enable unattended-upgrades via debconf
+      debconf:
+        name: unattended-upgrades
+        question: unattended-upgrades/enable_auto_updates
+        value: "true"
+        vtype: boolean
+
+    - name: Deploy custom unattended-upgrades config
+      copy:
+        dest: /etc/apt/apt.conf.d/51myunattended-upgrades
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          // Enable the update/upgrade script (0=disable)
+          APT::Periodic::Enable "1";
+
+          // Do "apt-get update" automatically every n-days (0=disable)
+          APT::Periodic::Update-Package-Lists "1";
+
+          // Do "apt-get upgrade --download-only" every n-days (0=disable)
+          APT::Periodic::Download-Upgradeable-Packages "1";
+
+          // Do "apt-get autoclean" every n-days (0=disable)
+          APT::Periodic::AutocleanInterval "7";
+
+          APT::Periodic::Verbose "2";
+          APT::Periodic::Unattended-Upgrade "1";
+
+          Unattended-Upgrade::Origins-Pattern {
+              "origin=Ubuntu,codename=${distro_codename},label=Ubuntu";
+              "origin=Ubuntu,codename=${distro_codename},label=Ubuntu-Security";
+              "origin=UbuntuESMApps,codename=${distro_codename},label=Ubuntu-Apps-Security";
+              "origin=UbuntuESM,codename=${distro_codename},label=Ubuntu-Infra-Security";
+          };
+
+          Unattended-Upgrade::Package-Blacklist {
+          };
+
+          Unattended-Upgrade::AutoFixInterruptedDpkg "true";
+          Unattended-Upgrade::InstallOnShutdown "false";
+          Unattended-Upgrade::Mail "{{ alert_email }}";
+          Unattended-Upgrade::MailOnlyOnError "false";
+          Unattended-Upgrade::Remove-Unused-Dependencies "true";
+          Unattended-Upgrade::Remove-New-Unused-Dependencies "true";
+
+          // Safe for servers — no automatic reboots
+          Unattended-Upgrade::Automatic-Reboot "false";
+          Unattended-Upgrade::Automatic-Reboot-WithUsers "false";
+
+    - name: Disable old 50unattended-upgrades config
+      command: >
+        mv /etc/apt/apt.conf.d/50unattended-upgrades
+           /etc/apt/apt.conf.d/50unattended-upgrades.disabled
+      args:
+        removes: /etc/apt/apt.conf.d/50unattended-upgrades
+
+    - name: Dry-run unattended-upgrades to validate config
+      command: unattended-upgrades --dry-run --debug
+      register: dry_run_result
+      changed_when: false
+
+    - name: Show dry-run output
+      debug:
+        msg: "{{ dry_run_result.stdout_lines[-20:] }}"  # last 20 lines
