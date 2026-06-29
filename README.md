@@ -147,29 +147,50 @@ Set them in the `vars:` block at the top of `server_hardening.yml`, or pass them
    ```bash
    # inventory.ini example
    [servers]
-   192.168.1.100 ansible_user=ubuntu
+   192.168.1.100 ansible_user=ubuntu ansible_ssh_private_key_file=~/.ssh/your_key
    ```
 
-3. (Recommended) Dry-run first to preview changes without applying them:
+3. Establish SSH trust with the target **before** the first run. Ansible
+   connects over SSH, and if the target's host key isn't yet in your control
+   machine's `~/.ssh/known_hosts`, the run aborts at *Gathering Facts* with
+   `UNREACHABLE! ... Host key verification failed`. Connect once manually so you
+   can verify and accept the fingerprint:
+   ```bash
+   ssh -i ~/.ssh/your_key ubuntu@192.168.1.100   # type "yes" to accept, then exit
+   ```
+   If the server was reinstalled and its host key **changed**, remove the stale
+   entry first (verify out-of-band before re-accepting — a changed key can also
+   indicate a man-in-the-middle):
+   ```bash
+   ssh-keygen -R 192.168.1.100
+   ssh -i ~/.ssh/your_key ubuntu@192.168.1.100   # re-accept the new fingerprint
+   ```
+
+4. (Recommended) Dry-run first to preview changes without applying them:
    ```bash
    ansible-playbook server_hardening.yml -i inventory.ini \
      -e "ssh_users=ubuntu sudo_users=ubuntu su_users=ubuntu" --check
    ```
 
-4. Run the hardening playbook, passing your user lists:
+5. Run the hardening playbook, passing your user lists:
    ```bash
    ansible-playbook server_hardening.yml -i inventory.ini \
      -e "ssh_users=ubuntu sudo_users=ubuntu su_users=ubuntu"
    ```
 
-5. After hardening, run a Lynis audit to score your configuration:
+6. After hardening, run a Lynis audit to score your configuration:
    ```bash
    sudo lynis audit system
    ```
 
-The play is idempotent: SSH is only restarted when `sshd_config` actually changes (via a handler), and re-running it produces no further changes once the host is hardened. NTP sync (`systemd-timesyncd`) is configured against `pool.ntp.org`.
+The play is idempotent: SSH is only restarted when `sshd_config` actually changes (via a handler), and re-running it produces no further changes once the host is hardened. NTP sync (`systemd-timesyncd`) is configured against `pool.ntp.org`. The read-only check tasks (`sshd -t`, `timedatectl`, the sudo-group check) run under `--check`; the tasks that change state (moduli filter, `dpkg-statoverride`, `unattended-upgrades --dry-run`) are skipped in check mode, so a dry-run is a preview, not a full validation.
 
 > **Warning**: The playbook sets `PasswordAuthentication no` in `sshd_config`. Ensure your SSH public key is already on the target server before running, or you will lose access. As a safety net, the previous `sshd_config` is backed up to `/etc/ssh/sshd_config-COPY-<timestamp>` and the new config is validated with `sshd -t` before it is applied.
+
+### Troubleshooting
+
+- **`UNREACHABLE! ... Host key verification failed`** — the target's SSH host key isn't trusted yet on the control machine. Resolve it as in step 3 (`ssh` once to accept the fingerprint, or `ssh-keygen -R <host>` then re-accept if the key changed). This is an SSH trust issue, not a playbook error — Ansible fails before any task runs.
+- **`The 'loop' value must resolve to a 'list', not 'str'`** — you're on an older revision; user lists are now normalized so both `-e "ssh_users=alice,bob"` and the JSON-list form work. Pull the latest playbook.
 
 ---
 

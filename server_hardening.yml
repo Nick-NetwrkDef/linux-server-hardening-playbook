@@ -95,6 +95,7 @@
     - name: Validate sshd_config syntax
       command: sshd -t
       changed_when: false
+      check_mode: false   # read-only validation; run under --check too
 
     - name: Ensure SSH service is enabled and running
       service:
@@ -125,7 +126,9 @@
       args:
         executable: /bin/bash
       register: moduli_filter
-      changed_when: "'removed=0' not in moduli_filter.stdout"
+      # This task mutates /etc/ssh/moduli, so it is (correctly) skipped under
+      # --check; guard the condition so it doesn't error on the undefined stdout.
+      changed_when: "moduli_filter.stdout is defined and 'removed=0' not in moduli_filter.stdout"
 
     # =========================================================================
     # 4. LIMIT SUDO ACCESS
@@ -135,6 +138,7 @@
       register: sudo_group_check
       changed_when: false
       failed_when: false
+      check_mode: false   # read-only; run under --check so stdout is available below
 
     - name: Show current sudo group members
       debug:
@@ -194,8 +198,10 @@
       # already exists and on a genuine error (exit 1 is only used by --list).
       # So we can't tell them apart by rc; discriminate on the message instead:
       # tolerate "already exists" (idempotent re-run), fail on anything else.
-      failed_when: su_override.rc != 0 and 'already exists' not in su_override.stderr
-      changed_when: su_override.rc == 0
+      # `rc is defined` guards the skipped case under --check (the command
+      # mutates the statoverride DB, so it does not run in check mode).
+      failed_when: su_override.rc is defined and su_override.rc != 0 and 'already exists' not in su_override.stderr
+      changed_when: su_override.rc is defined and su_override.rc == 0
 
     # =========================================================================
     # 6. VERIFY NTP IS RUNNING
@@ -204,6 +210,7 @@
       command: timedatectl
       register: timedatectl_status
       changed_when: false
+      check_mode: false   # read-only; run under --check so stdout is available below
 
     - name: Show timedatectl output
       debug:
@@ -319,7 +326,9 @@
 
     - name: Show dry-run output
       debug:
-        msg: "{{ dry_run_result.stdout_lines[-20:] }}"  # last 20 lines
+        # dry_run_result is skipped under --check (its command and the package
+        # install it depends on don't run in check mode), so guard the lookup.
+        msg: "{{ dry_run_result.stdout_lines[-20:] if dry_run_result.stdout_lines is defined else 'skipped (check mode)' }}"
 
   # ---------------------------------------------------------------------------
   # HANDLERS
