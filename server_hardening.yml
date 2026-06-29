@@ -227,8 +227,10 @@
         owner: root
         group: root
         mode: "0644"
+        # NOTE: the copy module does not inject `ansible_managed` (only the
+        # template module does), so use a static banner here.
         content: |
-          # {{ ansible_managed }}
+          # Managed by server_hardening.yml (Ansible) — do not edit by hand.
           [Time]
           NTP=0.pool.ntp.org 1.pool.ntp.org 2.pool.ntp.org 3.pool.ntp.org
           FallbackNTP=ntp.ubuntu.com
