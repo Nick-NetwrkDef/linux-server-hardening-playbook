@@ -34,6 +34,15 @@
         that: ansible_os_family == "Debian"
         fail_msg: "This playbook is designed for Debian/Ubuntu systems only."
 
+    # Accept either a real list (vars block / JSON -e) OR a comma-separated
+    # string (e.g. -e "ssh_users=alice,bob"). Plain `-e key=value` always
+    # arrives as a string, so normalize to a list before the loops below.
+    - name: Normalize user lists
+      set_fact:
+        ssh_users: "{{ ssh_users.split(',') | map('trim') | reject('equalto', '') | list if ssh_users is string else ssh_users }}"
+        sudo_users: "{{ sudo_users.split(',') | map('trim') | reject('equalto', '') | list if sudo_users is string else sudo_users }}"
+        su_users: "{{ su_users.split(',') | map('trim') | reject('equalto', '') | list if su_users is string else su_users }}"
+
   # ---------------------------------------------------------------------------
   # TASKS
   # ---------------------------------------------------------------------------
@@ -68,52 +77,26 @@
         mode: "0600"
 
     - name: Apply hardened sshd_config
-      blockinfile:
-        path: /etc/ssh/sshd_config
-        backup: false
-        marker: "# {mark} ANSIBLE MANAGED HARDENING BLOCK"
-        block: |
-          # --- Security settings ---
-          LogLevel VERBOSE
-          PermitUserEnvironment no
-          AllowTcpForwarding no
-          AllowStreamLocalForwarding no
-          GatewayPorts no
-          PermitTunnel no
-          PermitEmptyPasswords no
-          IgnoreRhosts yes
-          UseDNS yes
-          Compression no
-          TCPKeepAlive no
-          AllowAgentForwarding no
-          PermitRootLogin no
-          HostbasedAuthentication no
-          # --- Session & auth limits ---
-          AllowGroups sshusers
-          ClientAliveCountMax 3
-          ClientAliveInterval 15
-          LoginGraceTime 30
-          MaxAuthTries 3
-          MaxSessions 2
-          MaxStartups 3
-          PasswordAuthentication no
-
-    - name: Check for duplicate sshd_config keys (excluding HostKey)
-      shell: |
-        awk 'NF && $1!~/^(#|HostKey)/{print $1}' /etc/ssh/sshd_config \
-          | sort | uniq -c | grep -v ' 1 '
-      register: sshd_duplicates
-      changed_when: false
-      failed_when: sshd_duplicates.stdout | length > 0
+      template:
+        src: templates/sshd_config.j2
+        dest: /etc/ssh/sshd_config
+        owner: root
+        group: root
+        mode: "0644"
+        # validate aborts (and leaves the old file in place) if the rendered
+        # config is invalid, so a bad template can never lock us out.
+        validate: "sshd -t -f %s"
+      notify: Restart SSH service
 
     - name: Validate sshd_config syntax
       command: sshd -t
       changed_when: false
 
-    - name: Restart SSH service
+    - name: Ensure SSH service is enabled and running
       service:
-        name: ssh
-        state: restarted
+        # Debian/Ubuntu use ssh.service; fall back to sshd elsewhere.
+        name: "{{ 'ssh' if ansible_os_family == 'Debian' else 'sshd' }}"
+        state: started
         enabled: true
 
     # =========================================================================
@@ -130,11 +113,15 @@
 
     - name: Filter out short DH moduli (keep >= 3072 bits)
       shell: |
+        before=$(wc -l < /etc/ssh/moduli)
         awk '$5 >= 3071' /etc/ssh/moduli > /etc/ssh/moduli.tmp \
           && mv /etc/ssh/moduli.tmp /etc/ssh/moduli
+        after=$(wc -l < /etc/ssh/moduli)
+        echo "removed=$((before - after))"
       args:
         executable: /bin/bash
-      changed_when: true
+      register: moduli_filter
+      changed_when: "'removed=0' not in moduli_filter.stdout"
 
     # =========================================================================
     # 4. LIMIT SUDO ACCESS
@@ -174,7 +161,9 @@
     - name: Grant sudousers group full sudo access
       lineinfile:
         path: /etc/sudoers
-        line: "%sudousers   ALL=(ALL:ALL) NOPASSWD:ALL"
+        # Password required — do NOT use NOPASSWD here. A passwordless rule
+        # would let any compromised sudousers shell escalate to root instantly.
+        line: "%sudousers   ALL=(ALL:ALL) ALL"
         validate: "visudo -cf %s"
         state: present
 
@@ -197,8 +186,11 @@
     - name: Restrict /bin/su to suusers group (setuid 4750)
       command: dpkg-statoverride --update --add root suusers 4750 /bin/su
       register: su_override
-      # dpkg-statoverride exits 1 if the override already exists
-      failed_when: su_override.rc not in [0, 1, 2]
+      # dpkg-statoverride --add returns exit code 2 BOTH when the override
+      # already exists and on a genuine error (exit 1 is only used by --list).
+      # So we can't tell them apart by rc; discriminate on the message instead:
+      # tolerate "already exists" (idempotent re-run), fail on anything else.
+      failed_when: su_override.rc != 0 and 'already exists' not in su_override.stderr
       changed_when: su_override.rc == 0
 
     # =========================================================================
@@ -212,6 +204,34 @@
     - name: Show timedatectl output
       debug:
         msg: "{{ timedatectl_status.stdout_lines }}"
+
+    - name: Ensure systemd-timesyncd is installed
+      apt:
+        name: systemd-timesyncd
+        state: present
+
+    - name: Configure systemd-timesyncd NTP servers
+      copy:
+        dest: /etc/systemd/timesyncd.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # {{ ansible_managed }}
+          [Time]
+          NTP=0.pool.ntp.org 1.pool.ntp.org 2.pool.ntp.org 3.pool.ntp.org
+          FallbackNTP=ntp.ubuntu.com
+      notify: Restart systemd-timesyncd
+
+    - name: Enable NTP synchronization
+      command: timedatectl set-ntp true
+      changed_when: false
+
+    - name: Ensure systemd-timesyncd is enabled and running
+      service:
+        name: systemd-timesyncd
+        state: started
+        enabled: true
 
     # =========================================================================
     # 7. AUTOMATIC SECURITY UPDATES (unattended-upgrades + apticron)
@@ -255,10 +275,16 @@
           APT::Periodic::Unattended-Upgrade "1";
 
           Unattended-Upgrade::Origins-Pattern {
+          {% if ansible_distribution == 'Ubuntu' %}
               "origin=Ubuntu,codename=${distro_codename},label=Ubuntu";
               "origin=Ubuntu,codename=${distro_codename},label=Ubuntu-Security";
               "origin=UbuntuESMApps,codename=${distro_codename},label=Ubuntu-Apps-Security";
               "origin=UbuntuESM,codename=${distro_codename},label=Ubuntu-Infra-Security";
+          {% else %}
+              "origin=Debian,codename=${distro_codename},label=Debian";
+              "origin=Debian,codename=${distro_codename},label=Debian-Security";
+              "origin=Debian,codename=${distro_codename}-security,label=Debian-Security";
+          {% endif %}
           };
 
           Unattended-Upgrade::Package-Blacklist {
@@ -275,12 +301,12 @@
           Unattended-Upgrade::Automatic-Reboot "false";
           Unattended-Upgrade::Automatic-Reboot-WithUsers "false";
 
-    - name: Disable old 50unattended-upgrades config
-      command: >
-        mv /etc/apt/apt.conf.d/50unattended-upgrades
-           /etc/apt/apt.conf.d/50unattended-upgrades.disabled
-      args:
-        removes: /etc/apt/apt.conf.d/50unattended-upgrades
+    # NOTE: We intentionally leave the distro-provided 50unattended-upgrades in
+    # place. Our 51myunattended-upgrades sorts after it, so its scalar settings
+    # win, and APT *appends* Origins-Pattern list entries across files — so on
+    # Debian the distro file's correct origins stay active. Renaming the distro
+    # file would mean package updates can't manage it and could silently
+    # reintroduce it on upgrade.
 
     - name: Dry-run unattended-upgrades to validate config
       command: unattended-upgrades --dry-run --debug
@@ -290,3 +316,17 @@
     - name: Show dry-run output
       debug:
         msg: "{{ dry_run_result.stdout_lines[-20:] }}"  # last 20 lines
+
+  # ---------------------------------------------------------------------------
+  # HANDLERS
+  # ---------------------------------------------------------------------------
+  handlers:
+    - name: Restart SSH service
+      service:
+        name: "{{ 'ssh' if ansible_os_family == 'Debian' else 'sshd' }}"
+        state: restarted
+
+    - name: Restart systemd-timesyncd
+      service:
+        name: systemd-timesyncd
+        state: restarted

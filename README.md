@@ -29,18 +29,18 @@ Full credit and deep gratitude go to the original author and contributors of the
 
 ## What It Covers
 
-### Automated (Ansible Playbook — `playbooks/server_hardening.yml`)
+### Automated (Ansible Playbook — `server_hardening.yml`)
 
 The current playbook automates the following controls on **Debian/Ubuntu** targets:
 
 | Section | What It Does |
 |---|---|
 | **SSH Group** | Creates `sshusers` group; adds specified users |
-| **SSH Hardening** | Backs up and hardens `sshd_config` — disables root login, password auth, X11/TCP forwarding, enforces session limits and `AllowGroups` |
+| **SSH Hardening** | Backs up `sshd_config`, then renders a hardened config from a template — disables root login, password auth, X11/TCP forwarding, applies Mozilla "modern" ciphers/MACs/KEX, and enforces session limits and `AllowGroups` |
 | **Diffie-Hellman Cleanup** | Removes DH moduli shorter than 3072 bits from `/etc/ssh/moduli` |
-| **sudo Restriction** | Creates `sudousers` group; restricts `/etc/sudoers` to that group |
+| **sudo Restriction** | Creates `sudousers` group; grants password-required sudo (not `NOPASSWD`) via `/etc/sudoers` |
 | **su Restriction** | Creates `suusers` group; restricts `/bin/su` via `dpkg-statoverride` |
-| **NTP Verification** | Checks `timedatectl` status and reports sync state |
+| **NTP Sync** | Enables NTP via `timedatectl set-ntp true` and configures `systemd-timesyncd` |
 | **Automatic Updates** | Installs and configures `unattended-upgrades`, `apt-listchanges`, and `apticron` for automated security patching and email alerts |
 
 ### Reference Documentation (Planned — `/docs`)
@@ -79,15 +79,22 @@ The following areas are covered in reference docs and/or planned for future play
 
 ---
 
-## Known Limitations and Planned Fixes
+## Recently Fixed
 
-The following issues are known in the current `server_hardening.yml` playbook and are tracked for resolution:
+The following issues were identified in an audit of `server_hardening.yml` and have been resolved:
 
-- **`sshd_config` hardening uses `blockinfile`** — this does not remove pre-existing conflicting settings. A full file template or per-setting `lineinfile` approach is planned to prevent silent conflicts.
-- **Missing cipher/MAC/KexAlgorithm hardening** — Mozilla's recommended OpenSSH cipher suite is not yet applied by the playbook. Manual configuration is required for now; see the [original guide's SSH section](https://github.com/imthenachoman/How-To-Secure-A-Linux-Server#secure-etcsshsshd_config).
-- **`unattended-upgrades` origins are Ubuntu-specific** — the `Origins-Pattern` block in the playbook uses Ubuntu labels and will not correctly match security updates on Debian. Conditional logic per `ansible_distribution` is planned.
-- **NTP is verified but not configured** — the playbook checks `timedatectl` status but does not enable or configure `systemd-timesyncd`. A proper NTP configuration task is planned.
-- **`dpkg-statoverride` exit code 2 is tolerated** — exit code 2 is a genuine argument error and should not be suppressed. This will be tightened to only tolerate exit code 1 (entry already exists).
+- **`sshd_config` now rendered from a template** — replaced the fragile `blockinfile` approach (which could be silently overridden by a pre-existing earlier directive) with a full `templates/sshd_config.j2`. Hardened directives are emitted *before* the `Include /etc/ssh/sshd_config.d/*.conf` line so cloud-init drop-ins cannot override them, and the task uses `validate: sshd -t -f %s` so a bad config can never lock you out.
+- **Cipher/MAC/KexAlgorithm hardening added** — Mozilla's "modern" OpenSSH cipher suite, MACs, and key-exchange algorithms are now applied by the template.
+- **`unattended-upgrades` origins are now distribution-aware** — the `Origins-Pattern` block emits Debian labels on Debian and Ubuntu labels on Ubuntu, conditioned on `ansible_distribution`.
+- **NTP is now configured, not just checked** — the playbook runs `timedatectl set-ntp true` and configures `systemd-timesyncd` in addition to reporting status.
+- **`sudo` no longer passwordless** — the `sudousers` rule was `NOPASSWD:ALL`; it now requires a password (`%sudousers ALL=(ALL:ALL) ALL`).
+- **`dpkg-statoverride` re-runs are now idempotent** — `--add` returns exit code 2 *both* when the override already exists and on a genuine error (exit 1 is only used by `--list`), so the task discriminates on the `already exists` message rather than the exit code: it stays idempotent on re-runs while still failing on real errors.
+- **Distro `50unattended-upgrades` left intact** — instead of renaming the distro-provided file (which package upgrades could undo), the custom config lives in `51myunattended-upgrades`, which takes precedence by filename ordering.
+
+### Still Planned
+
+- Per-setting overrides for any additional drop-in files under `/etc/ssh/sshd_config.d/` that ship conflicting defaults.
+- Optional 2FA/MFA, firewall, and kernel-hardening automation (see the reference docs section above).
 
 ---
 
@@ -123,6 +130,29 @@ This repository does **not** replace the original guide. If you are new to Linux
 - Ansible installed on your control machine
 - SSH access to the target server with a user that has `sudo` privileges
 - SSH public key already deployed to the target (the playbook sets `PasswordAuthentication no`)
+- Run from the repository root so the playbook can find `templates/sshd_config.j2` (the SSH config is rendered from this template)
+
+### Configuring users
+
+The playbook manages three groups and adds the users you specify to each:
+
+| Variable | Group created | Purpose |
+|---|---|---|
+| `ssh_users` | `sshusers` | Allowed to log in over SSH (`AllowGroups sshusers`) |
+| `sudo_users` | `sudousers` | Granted password-required `sudo` |
+| `su_users` | `suusers` | Allowed to run `/bin/su` |
+
+Set them in the `vars:` block at the top of `server_hardening.yml`, or pass them on the command line with `-e`. Both a **comma-separated string** and a **JSON list** are accepted — the playbook normalizes either into a list:
+
+```bash
+# comma-separated (simplest)
+-e "ssh_users=alice,bob sudo_users=alice su_users=alice"
+
+# JSON list (use single quotes around the whole object)
+-e '{"ssh_users": ["alice","bob"], "sudo_users": ["alice"], "su_users": ["alice"]}'
+```
+
+> Note: `-e "ssh_users=[...]"` (a bare list literal in `key=value` form) does **not** work — Ansible treats it as a plain string. Use one of the two forms above.
 
 ### Running the Playbook
 
@@ -139,36 +169,49 @@ This repository does **not** replace the original guide. If you are new to Linux
    192.168.1.100 ansible_user=ubuntu
    ```
 
-3. Run the hardening playbook, passing your user lists:
+3. (Recommended) Dry-run first to preview changes without applying them:
    ```bash
-   ansible-playbook playbooks/server_hardening.yml -i inventory.ini \
-     -e "ssh_users=['ubuntu'] sudo_users=['ubuntu'] su_users=['ubuntu']"
+   ansible-playbook server_hardening.yml -i inventory.ini \
+     -e "ssh_users=ubuntu sudo_users=ubuntu su_users=ubuntu" --check
    ```
 
-4. After hardening, run a Lynis audit to score your configuration:
+4. Run the hardening playbook, passing your user lists:
+   ```bash
+   ansible-playbook server_hardening.yml -i inventory.ini \
+     -e "ssh_users=ubuntu sudo_users=ubuntu su_users=ubuntu"
+   ```
+
+5. After hardening, run a Lynis audit to score your configuration:
    ```bash
    sudo lynis audit system
    ```
 
-> **Warning**: The playbook sets `PasswordAuthentication no` in `sshd_config`. Ensure your SSH public key is already on the target server before running, or you will lose access.
+The play is idempotent: SSH is only restarted when `sshd_config` actually changes (via a handler), and re-running it produces no further changes once the host is hardened. NTP sync (`systemd-timesyncd`) is configured against `pool.ntp.org`.
+
+> **Warning**: The playbook sets `PasswordAuthentication no` in `sshd_config`. Ensure your SSH public key is already on the target server before running, or you will lose access. As a safety net, the previous `sshd_config` is backed up to `/etc/ssh/sshd_config-COPY-<timestamp>` and the new config is validated with `sshd -t` before it is applied.
 
 ---
 
 ## Repository Structure
 
+Current layout:
+
 ```
 linux-server-hardening-playbook/
-├── CHECKLIST.md                  # Step-by-step hardening checklist
-├── docs/
-│   ├── ssh.md                    # SSH hardening reference
-│   ├── firewall.md               # UFW + PSAD + Fail2Ban reference
-│   ├── users.md                  # User/privilege control reference
-│   ├── auditing.md               # Monitoring and auditing tools
-│   └── kernel.md                 # Sysctl and kernel hardening
-├── playbooks/
-│   └── server_hardening.yml      # Main Ansible hardening playbook
-├── scripts/                      # Standalone shell scripts
+├── server_hardening.yml          # Main Ansible hardening playbook
+├── templates/
+│   └── sshd_config.j2            # Hardened sshd_config rendered by the playbook
+├── inventory.ini                 # Example inventory
+├── LICENSE
 └── README.md
+```
+
+Planned additions (not yet present in the repo):
+
+```
+├── CHECKLIST.md                  # Step-by-step hardening checklist
+├── docs/                         # SSH / firewall / users / auditing / kernel references
+└── scripts/                      # Standalone shell scripts
 ```
 
 ---

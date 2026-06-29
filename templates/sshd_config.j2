@@ -1,0 +1,68 @@
+# =============================================================================
+# {{ ansible_managed }}
+# Hardened sshd_config — managed by server_hardening.yml
+#
+# DO NOT EDIT BY HAND. Changes will be overwritten on the next playbook run.
+# A timestamped backup of the previous file is kept at
+# /etc/ssh/sshd_config-COPY-<timestamp>.
+#
+# NOTE ON ORDERING: sshd uses the FIRST obtained value for each keyword.
+# All hardened directives are therefore declared at the TOP of this file,
+# BEFORE the drop-in Include, so that anything cloud-init or a package drops
+# into /etc/ssh/sshd_config.d/*.conf (e.g. "PasswordAuthentication yes")
+# cannot override these settings.
+# =============================================================================
+
+# --- Listener ---
+Port 22
+
+# --- Authentication ---
+PermitRootLogin no
+PasswordAuthentication no
+PermitEmptyPasswords no
+KbdInteractiveAuthentication no
+HostbasedAuthentication no
+IgnoreRhosts yes
+PubkeyAuthentication yes
+UsePAM yes
+
+# --- Access control ---
+AllowGroups sshusers
+
+# --- Forwarding / tunnelling ---
+AllowTcpForwarding no
+AllowStreamLocalForwarding no
+AllowAgentForwarding no
+GatewayPorts no
+PermitTunnel no
+X11Forwarding no
+
+# --- Session & rate limits ---
+ClientAliveCountMax 3
+ClientAliveInterval 300        # 300s x 3 = ~15 min idle before disconnect
+LoginGraceTime 30
+MaxAuthTries 3
+MaxSessions 2
+MaxStartups 10:30:60           # start/rate/full — avoids dropping bursts of valid conns
+
+# --- Misc hardening ---
+LogLevel VERBOSE
+PermitUserEnvironment no
+Compression no
+TCPKeepAlive no
+UseDNS no                      # avoids reverse-DNS login delays (guide/Mozilla default)
+
+# --- Modern cryptography (Mozilla OpenSSH "modern" guidelines) ---
+KexAlgorithms curve25519-sha256@libssh.org,ecdh-sha2-nistp256,ecdh-sha2-nistp384,ecdh-sha2-nistp521,diffie-hellman-group-exchange-sha256
+Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr
+MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,umac-128-etm@openssh.com
+
+# Host keys are intentionally NOT pinned here; sshd uses its compiled-in
+# defaults (/etc/ssh/ssh_host_*_key) so a missing key path never breaks `sshd -t`.
+
+# --- SFTP subsystem ---
+Subsystem sftp /usr/lib/openssh/sftp-server
+
+# --- Drop-in directory (parsed AFTER the directives above, so it cannot
+#     override them for first-match keywords) ---
+Include /etc/ssh/sshd_config.d/*.conf
