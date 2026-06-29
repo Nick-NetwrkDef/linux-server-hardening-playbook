@@ -79,25 +79,6 @@ The following areas are covered in reference docs and/or planned for future play
 
 ---
 
-## Recently Fixed
-
-The following issues were identified in an audit of `server_hardening.yml` and have been resolved:
-
-- **`sshd_config` now rendered from a template** — replaced the fragile `blockinfile` approach (which could be silently overridden by a pre-existing earlier directive) with a full `templates/sshd_config.j2`. Hardened directives are emitted *before* the `Include /etc/ssh/sshd_config.d/*.conf` line so cloud-init drop-ins cannot override them, and the task uses `validate: sshd -t -f %s` so a bad config can never lock you out.
-- **Cipher/MAC/KexAlgorithm hardening added** — Mozilla's "modern" OpenSSH cipher suite, MACs, and key-exchange algorithms are now applied by the template.
-- **`unattended-upgrades` origins are now distribution-aware** — the `Origins-Pattern` block emits Debian labels on Debian and Ubuntu labels on Ubuntu, conditioned on `ansible_distribution`.
-- **NTP is now configured, not just checked** — the playbook runs `timedatectl set-ntp true` and configures `systemd-timesyncd` in addition to reporting status.
-- **`sudo` no longer passwordless** — the `sudousers` rule was `NOPASSWD:ALL`; it now requires a password (`%sudousers ALL=(ALL:ALL) ALL`).
-- **`dpkg-statoverride` re-runs are now idempotent** — `--add` returns exit code 2 *both* when the override already exists and on a genuine error (exit 1 is only used by `--list`), so the task discriminates on the `already exists` message rather than the exit code: it stays idempotent on re-runs while still failing on real errors.
-- **Distro `50unattended-upgrades` left intact** — instead of renaming the distro-provided file (which package upgrades could undo), the custom config lives in `51myunattended-upgrades`, which takes precedence by filename ordering.
-
-### Still Planned
-
-- Per-setting overrides for any additional drop-in files under `/etc/ssh/sshd_config.d/` that ship conflicting defaults.
-- Optional 2FA/MFA, firewall, and kernel-hardening automation (see the reference docs section above).
-
----
-
 ## Who This Is For
 
 - **MSPs and MSSPs** deploying servers for clients and needing a repeatable hardening baseline
